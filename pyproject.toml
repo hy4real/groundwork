@@ -1,5 +1,5 @@
 [project]
-name = "agent-lab"
+name = "groundwork"
 version = "1.5.0"
 description = "Provider-agnostic local evidence research agent and runtime experiments"
 readme = "README.md"
@@ -27,7 +27,7 @@ serve = ["fastapi>=0.115", "uvicorn>=0.30"]
 agentlab = "agentlab.cli:main"
 
 [project.urls]
-Repository = "https://github.com/hy4real/agent-lab"
+Repository = "https://github.com/hy4real/groundwork"
 
 [build-system]
 requires = ["hatchling>=1.25"]

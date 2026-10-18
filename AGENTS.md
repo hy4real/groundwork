@@ -17,7 +17,7 @@ Provider 无关的 Evidence Research Agent 与 Agent 运行时实验项目。主
 ## 目录结构
 
 ```
-agent-lab/
+groundwork/
 ├── src/agentlab/
 │   ├── messages.py      # 消息契约与 token 估算
 │   ├── memory.py        # ShortTermMemory：窗口管理、摘要触发、上下文注入

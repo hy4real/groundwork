@@ -213,7 +213,7 @@ merely burns the step budget now fails loudly instead of passing quietly.
 ## Reproduce
 
 ```bash
-cd ~/agent-lab
+cd ~/groundwork
 # E1
 python - <<'PY'
 import pathlib

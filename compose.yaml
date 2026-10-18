@@ -1,7 +1,7 @@
 services:
   api:
     build: .
-    image: agent-lab:local
+    image: groundwork:local
     init: true
     user: "10001:10001"
     entrypoint: ["agentlab"]
@@ -24,7 +24,7 @@ services:
         max-size: "10m"
         max-file: "3"
   worker:
-    image: agent-lab:local
+    image: groundwork:local
     init: true
     user: "10001:10001"
     entrypoint: ["agentlab"]

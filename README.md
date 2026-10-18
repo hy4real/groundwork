@@ -1,4 +1,4 @@
-# Agent Lab
+# Groundwork
 
 Provider 无关、无框架的本地 Evidence Research Agent。它把短期/长期记忆、ReAct、工具调用、检索、评测和可观测组件接成一条可运行主链路，并用精确 span 校验阻止无证据事实进入答案。项目适合研究 Agent 运行时边界、可复算评测和 grounded retrieval；它不是生产服务或模型质量基准。
 
@@ -6,7 +6,7 @@ Provider 无关、无框架的本地 Evidence Research Agent。它把短期/长�
 
 项目已有公开维护的脱敏快照，默认路径完全离线。代码、fixture、测试、Demo 和构建审计均可在本仓库内复核；不声明真实用户、生产部署、社区采用或外部影响力。
 
-公开仓库：https://github.com/hy4real/agent-lab
+公开仓库：https://github.com/hy4real/groundwork
 
 ## 快速开始
 
@@ -64,8 +64,8 @@ Hybrid retrieval 是显式安装和显式选择的可选路径；默认 lexical 
 
 ```bash
 .venv/bin/agentlab serve --corpus ./example/corpus --port 8000
-docker build -t agent-lab:local .
-docker run --rm -v "$PWD/example/corpus:/corpus:ro" -p 127.0.0.1:8000:8000 agent-lab:local
+docker build -t groundwork:local .
+docker run --rm -v "$PWD/example/corpus:/corpus:ro" -p 127.0.0.1:8000:8000 groundwork:local
 ```
 
 默认 API 提供 `GET /health` 和 `POST /v1/research`。本地服务只监听 `127.0.0.1`；请求只能提交 question，不能指定本地路径。
