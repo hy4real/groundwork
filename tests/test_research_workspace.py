@@ -294,3 +294,83 @@ def test_read_rejects_fifo_swapped_after_resolve(
     monkeypatch.setattr(ws, "_resolve_with_parent", swap_to_fifo)
     with pytest.raises(WorkspaceError, match="path_not_regular_file"):
         ws.read_text("notes/a.md")
+
+
+def test_write_overwrite_rejects_fifo_without_blocking_and_exclusive_rejects_swapped_symlink(
+    ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "secret.md"
+    outside.write_text("top-secret", encoding="utf-8")
+    original = ws._resolve_with_parent
+
+    def swap_to_fifo(relative: str, *, must_exist: bool = True):
+        resolved = original(relative, must_exist=must_exist)
+        target = ws.root / relative
+        if target.exists():
+            target.unlink()
+        os.mkfifo(target)
+        return resolved
+
+    monkeypatch.setattr(ws, "_resolve_with_parent", swap_to_fifo)
+    with pytest.raises(WorkspaceError, match="path_not_regular_file"):
+        ws.write_text("notes/a.md", "blocked", overwrite=True)
+
+    def swap_to_symlink(relative: str, *, must_exist: bool = True):
+        resolved = original(relative, must_exist=must_exist)
+        target = ws.root / relative
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(ws, "_resolve_with_parent", swap_to_symlink)
+    with pytest.raises(WorkspaceError, match="file_exists"):
+        ws.write_text("notes/exclusive-link.md", "pwned", overwrite=False)
+    assert outside.read_text(encoding="utf-8") == "top-secret"
+
+
+def test_scope_permits_normalized_roots_dot_root_and_globstar_deny_globs() -> None:
+    dot_scope = PathScope(mode="allow", roots=(".",), deny_globs=("**/*.key",))
+    assert scope_permits(dot_scope, "b.md") is True
+    assert scope_permits(dot_scope, "notes/a.md") is True
+    assert scope_permits(dot_scope, "secret.key") is False
+    assert scope_permits(dot_scope, "notes/secret.key") is False
+
+    nested_scope = PathScope(
+        mode="allow",
+        roots=("./notes/", "docs//sub"),
+        deny_globs=("notes/**/*.key",),
+    )
+    assert scope_permits(nested_scope, "notes/a.md") is True
+    assert scope_permits(nested_scope, "docs/sub/page.md") is True
+    assert scope_permits(nested_scope, "notes_other/a.md") is False
+    assert scope_permits(nested_scope, "notes/secret.key") is False
+    assert scope_permits(nested_scope, "notes/deep/secret.key") is False
+
+    for bad_root in ("a/../b", "\\notes", "a\x00b"):
+        with pytest.raises(ValueError):
+            PathScope(mode="allow", roots=(bad_root,))
+    for bad_glob in ("", "/notes/*.key", "../x", "\\x", "a\x00b", "."):
+        with pytest.raises(ValueError):
+            PathScope(mode="allow", roots=("notes",), deny_globs=(bad_glob,))
+
+
+def test_workspace_relative_root_survives_chdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    (ws_dir / "a.md").write_text("from-ws", encoding="utf-8")
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    (other_dir / "ws").mkdir()
+    (other_dir / "ws" / "a.md").write_text("from-other", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    ws = Workspace(Path("ws"))
+    monkeypatch.chdir(other_dir)
+    assert ws.read_text("a.md") == ("from-ws", 7)
+
+
+def test_resolve_converts_oserror_to_workspace_error(ws: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: (_ for _ in ()).throw(OSError("gone")))
+    with pytest.raises(WorkspaceError, match="path_unreadable"):
+        ws.resolve("notes/a.md")

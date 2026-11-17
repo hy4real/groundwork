@@ -12,9 +12,11 @@ module enforces *how* a path inside those roots is resolved.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import os
 import stat
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 PATH_MODES = frozenset({"allow", "deny", "interrupt"})
@@ -50,12 +52,47 @@ class PathScope:
         if self.mode == "allow" and not self.roots:
             raise ValueError("allow 模式必须至少声明一个 root")
         for root in self.roots:
-            if not root or root.startswith("/") or ".." in PurePosixPath(root).parts:
-                raise ValueError("root 必须是相对路径且不含 ..")
+            _validate_scope_root(root)
+        for pattern in self.deny_globs:
+            _validate_deny_glob(pattern)
 
 
 def _reject(reason: str) -> "WorkspaceError":
     return WorkspaceError(reason)
+
+
+def _validate_scope_root(root: str) -> tuple[str, ...]:
+    if (
+        not isinstance(root, str)
+        or not root
+        or "\x00" in root
+        or root.startswith("/")
+        or root.startswith("\\")
+        or (":" in root.split("/")[0] and os.name == "nt")
+    ):
+        raise ValueError("root 必须是相对路径且不含 ..")
+    raw_parts = root.split("/")
+    if ".." in raw_parts:
+        raise ValueError("root 必须是相对路径且不含 ..")
+    return tuple(part for part in raw_parts if part not in ("", "."))
+
+
+def _validate_deny_glob(pattern: str) -> tuple[str, ...]:
+    if (
+        not isinstance(pattern, str)
+        or not pattern
+        or "\x00" in pattern
+        or pattern.startswith("/")
+        or pattern.startswith("\\")
+    ):
+        raise ValueError("deny_glob 必须是有效相对模式")
+    raw_parts = pattern.split("/")
+    if ".." in raw_parts:
+        raise ValueError("deny_glob 必须是有效相对模式")
+    parts = tuple(part for part in raw_parts if part not in ("", "."))
+    if not parts:
+        raise ValueError("deny_glob 必须是有效相对模式")
+    return parts
 
 
 def _require_open_flag(name: str) -> int:
@@ -99,10 +136,16 @@ class Workspace:
         root = Path(root)
         if root.is_symlink():
             raise _reject("root_symlink")
-        if not root.is_dir():
+        abs_root = Path(os.path.abspath(root))
+        if abs_root.is_symlink():
+            raise _reject("root_symlink")
+        if not abs_root.is_dir():
             raise _reject("root_not_directory")
-        self._root = root
-        self._root_real = root.resolve(strict=True)
+        self._root = abs_root
+        try:
+            self._root_real = abs_root.resolve(strict=True)
+        except OSError as exc:
+            raise _reject("root_unreadable") from exc
 
     @property
     def root(self) -> Path:
@@ -171,6 +214,8 @@ class Workspace:
                 if must_exist:
                     raise _reject("path_missing") from None
                 last_info = None
+            except OSError as exc:
+                raise _reject("path_unreadable") from exc
             if last_info is not None:
                 if stat.S_ISLNK(last_info.st_mode):
                     raise _reject("path_symlink")
@@ -178,7 +223,10 @@ class Workspace:
                     raise _reject("path_not_regular_file")
 
             candidate = self._root.joinpath(*parts)
-            resolved = candidate.parent.resolve(strict=True).joinpath(last)
+            try:
+                resolved = candidate.parent.resolve(strict=True).joinpath(last)
+            except OSError as exc:
+                raise _reject("path_unreadable") from exc
             if not resolved.is_relative_to(self._root_real):
                 raise _reject("path_outside_scope")
             return fd, last, resolved
@@ -253,7 +301,8 @@ class Workspace:
                 | os.O_CREAT
                 | _require_open_flag("O_NOFOLLOW")
                 | getattr(os, "O_CLOEXEC", 0)
-                | (os.O_TRUNC if overwrite else os.O_EXCL)
+                | getattr(os, "O_NONBLOCK", 0)
+                | (0 if overwrite else os.O_EXCL)
             )
             try:
                 descriptor = os.open(last, flags, 0o600, dir_fd=dir_fd)
@@ -262,10 +311,17 @@ class Workspace:
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
                     raise _reject("path_symlink") from exc
+                if exc.errno in (errno.ENXIO, errno.EISDIR):
+                    raise _reject("path_not_regular_file") from exc
                 raise _reject("write_failed") from exc
             try:
                 if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                     raise _reject("path_not_regular_file")
+                if overwrite:
+                    try:
+                        os.ftruncate(descriptor, 0)
+                    except OSError as exc:
+                        raise _reject("write_failed") from exc
             except Exception:
                 os.close(descriptor)
                 raise
@@ -281,6 +337,36 @@ class Workspace:
         return len(payload)
 
 
+def _glob_matches(parts: tuple[str, ...], joined: str, pattern: str) -> bool:
+    if PurePosixPath(joined).match(pattern):
+        return True
+    raw_pattern = _validate_deny_glob(pattern)
+    collapsed: list[str] = []
+    for segment in raw_pattern:
+        if segment == "**" and collapsed and collapsed[-1] == "**":
+            continue
+        collapsed.append(segment)
+
+    @lru_cache(maxsize=None)
+    def match_from(path_index: int, glob_index: int) -> bool:
+        if glob_index == len(collapsed):
+            return path_index == len(parts)
+        segment = collapsed[glob_index]
+        if segment == "**":
+            if glob_index == len(collapsed) - 1:
+                return path_index < len(parts)
+            return match_from(path_index, glob_index + 1) or (
+                path_index < len(parts) and match_from(path_index + 1, glob_index)
+            )
+        if path_index == len(parts):
+            return False
+        return fnmatch.fnmatchcase(parts[path_index], segment) and match_from(
+            path_index + 1, glob_index + 1
+        )
+
+    return match_from(0, 0)
+
+
 def scope_permits(scope: PathScope, relative: str) -> bool:
     """Containment check against a declared scope.
 
@@ -293,6 +379,13 @@ def scope_permits(scope: PathScope, relative: str) -> bool:
     parts = _relative_parts(relative)
     joined = "/".join(parts)
     for pattern in scope.deny_globs:
-        if PurePosixPath(joined).match(pattern):
+        if _glob_matches(parts, joined, pattern):
             return False
-    return any(joined == root or joined.startswith(root.rstrip("/") + "/") for root in scope.roots)
+    for root in scope.roots:
+        root_parts = _validate_scope_root(root)
+        if not root_parts:
+            return True
+        norm_root = "/".join(root_parts)
+        if joined == norm_root or joined.startswith(norm_root + "/"):
+            return True
+    return False

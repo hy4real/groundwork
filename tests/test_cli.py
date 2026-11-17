@@ -339,6 +339,25 @@ def test_research_rag_eval_uses_index_provenance(
     assert json.loads(capsys.readouterr().out)["result"] == "passed"
     assert closed == [True]
 
+    failing_report = SimpleNamespace(
+        passed=False,
+        to_dict=lambda: {"result": "failed_contract", "passed": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_rag_evaluation",
+        lambda cases, loaded_corpus, hybrid, **kwargs: failing_report,
+    )
+    assert main([
+        "research-rag-eval",
+        "--suite-root",
+        str(tmp_path / "suite"),
+        "--index-dir",
+        str(tmp_path / "index"),
+    ]) == 1
+    assert json.loads(capsys.readouterr().out)["passed"] is False
+    assert closed == [True, True]
+
 
 def test_hybrid_cli_requires_index_and_records_mode(tmp_path: Path, capsys) -> None:
     (tmp_path / "fact.md").write_text("synthetic", encoding="utf-8")
@@ -521,6 +540,84 @@ def test_research_cli_wires_workspace_and_path_scope(tmp_path: Path, capsys) -> 
     err = capsys.readouterr().err
     assert err == "error: agentlab_command_failed\n"
     assert str(symlink_ws) not in err
+
+    assert (
+        main([
+            "research",
+            "--corpus",
+            str(corpus_dir),
+            "--workspace",
+            str(ws_dir),
+            "--path-scope",
+            "allow",
+            "--scope-root",
+            ".",
+            "--deny-glob",
+            "**/*.key",
+            "--question",
+            "What is the Helix fixture status?",
+        ])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["trace"]["path_scope_mode"] == "allow"
+
+    assert (
+        main([
+            "research",
+            "--corpus",
+            str(corpus_dir),
+            "--workspace",
+            str(ws_dir),
+            "--path-scope",
+            "allow",
+            "--scope-root",
+            "notes",
+            "--deny-glob",
+            "/etc/*",
+            "--question",
+            "q",
+        ])
+        == 2
+    )
+    assert capsys.readouterr().err == "error: agentlab_command_failed\n"
+
+
+def test_research_suite_eval_report_errors_are_redacted_and_reject_symlinks(
+    tmp_path: Path, capsys
+) -> None:
+    repo_root = Path(__file__).parents[1]
+    missing_parent = tmp_path / "secret-missing-dir" / "report.json"
+    assert (
+        main([
+            "research-suite-eval",
+            "--suite-root",
+            str(repo_root / "evals" / "risk-v1"),
+            "--report",
+            str(missing_parent),
+        ])
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: agentlab_command_failed\n"
+    assert "secret-missing-dir" not in captured.err
+
+    victim = tmp_path / "victim.json"
+    victim.write_text("untouched", encoding="utf-8")
+    link_report = tmp_path / "report-link.json"
+    link_report.symlink_to(victim)
+    assert (
+        main([
+            "research-suite-eval",
+            "--suite-root",
+            str(repo_root / "evals" / "risk-v1"),
+            "--report",
+            str(link_report),
+        ])
+        == 2
+    )
+    assert capsys.readouterr().err == "error: agentlab_command_failed\n"
+    assert victim.read_text(encoding="utf-8") == "untouched"
 
 
 def test_serve_cli_wires_workspace_and_rejects_writable_task_db(tmp_path: Path, monkeypatch, capsys) -> None:

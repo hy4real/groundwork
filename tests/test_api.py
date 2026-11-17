@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 from agentlab.api import create_app
+from agentlab.reasoning import Action
 from agentlab.research.corpus import Corpus
 from agentlab.research.tasks import MAX_OUTSTANDING_TASKS, ResearchTaskStore, TaskStoreError
 from agentlab.research.worker import ResearchWorker
@@ -297,3 +298,69 @@ async def test_api_wires_workspace_path_scope_and_enforces_task_read_only_bounda
         )
     assert response.status_code == 200
     assert response.json()["trace"]["path_scope_mode"] == "allow"
+
+
+@pytest.mark.anyio
+async def test_api_research_endpoint_enforces_workspace_tools_through_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "fact.md").write_text("The API fixture state is healthy.", encoding="utf-8")
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    (ws_dir / "notes").mkdir()
+    (ws_dir / "notes" / "ok.md").write_text("allowed", encoding="utf-8")
+    (ws_dir / "notes" / "secret.key").write_text("secret-key", encoding="utf-8")
+    (ws_dir / "outside.md").write_text("outside", encoding="utf-8")
+
+    class ScriptedApiReasoner:
+        def __init__(self) -> None:
+            self.calls = (
+                ("read_file", '{"path":"outside.md"}'),
+                ("read_file", '{"path":"notes/secret.key"}'),
+                ("write_file", '{"path":"notes/created.md","text":"api-ok"}'),
+            )
+            self.index = 0
+
+        def decide(self, *, task, context, available_tools):
+            assert "read_file" in available_tools and "write_file" in available_tools
+            if self.index < len(self.calls):
+                tool, arg = self.calls[self.index]
+                self.index += 1
+                return Action(kind="tool", tool=tool, argument=arg)
+            return Action(
+                kind="finish",
+                answer='{"status":"insufficient_evidence","answer":"","claims":[],"reason":"checked"}',
+            )
+
+    monkeypatch.setattr("agentlab.research.agent.ReplayResearchReasoner", ScriptedApiReasoner)
+
+    app_deny = create_app(corpus_dir, workspace_root=ws_dir)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_deny), base_url="http://127.0.0.1") as client:
+        denied = await client.post(
+            "/v1/research",
+            json={"question": "test deny"},
+            headers={"X-AgentLab-Token": app_deny.state.session_token},
+        )
+    assert denied.status_code == 200
+    assert denied.json()["trace"]["write_calls"] == 0
+    assert all(event["status"] == "error" for event in denied.json()["trace"]["tool_events"])
+    assert not (ws_dir / "notes" / "created.md").exists()
+
+    app_allow = create_app(
+        corpus_dir,
+        workspace_root=ws_dir,
+        path_scope=PathScope(mode="allow", roots=("notes",), deny_globs=("notes/**/*.key",)),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_allow), base_url="http://127.0.0.1") as client:
+        allowed = await client.post(
+            "/v1/research",
+            json={"question": "test allow"},
+            headers={"X-AgentLab-Token": app_allow.state.session_token},
+        )
+    assert allowed.status_code == 200
+    payload = allowed.json()
+    assert payload["trace"]["write_calls"] == 1
+    assert [e["status"] for e in payload["trace"]["tool_events"]] == ["error", "error", "ok"]
+    assert (ws_dir / "notes" / "created.md").read_text(encoding="utf-8") == "api-ok"

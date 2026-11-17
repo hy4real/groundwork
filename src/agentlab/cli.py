@@ -247,6 +247,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             suite_report = run_declarative_suite(args.suite_root)
             suite_payload = suite_report.to_dict()
             if args.report is not None:
+                if args.report.is_symlink():
+                    raise ValueError("report 不可为符号链接")
                 args.report.write_text(
                     json.dumps(suite_payload, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
                     encoding="utf-8",
@@ -353,6 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         EvaluationError,
         LocalClaimEvaluationError,
         LongTermMemoryError,
+        OSError,
         RagEvaluationError,
         RagIndexError,
         ValueError,
