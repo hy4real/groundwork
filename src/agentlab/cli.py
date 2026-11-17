@@ -43,6 +43,7 @@ from .research.vector_index import (
     build_local_index,
     verify_local_index,
 )
+from .research.workspace import PathScope, Workspace
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -61,6 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     research.add_argument("--index-dir", type=Path)
     research.add_argument("--model-cache", type=Path)
     research.add_argument("--prompt-profile", choices=prompt_profile_ids())
+    _add_workspace_arguments(research)
 
     index = subparsers.add_parser("research-index", help="build or verify a local Qdrant index")
     index.add_argument("action", choices=("build", "verify", "rebuild"))
@@ -130,6 +132,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--bind", choices=("loopback", "container"), default="loopback")
     serve.add_argument("--task-db", type=Path, help="enable persistent task API using a private SQLite path")
+    _add_workspace_arguments(serve)
 
     worker = subparsers.add_parser("research-worker", help="process persistent offline research tasks")
     worker.add_argument("--corpus", required=True, type=Path)
@@ -152,6 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "research":
             corpus = Corpus.load(args.corpus)
+            workspace, path_scope = _build_workspace_and_scope(args)
             if args.retrieval == "lexical" and (
                 args.index_dir is not None or args.model_cache is not None
             ):
@@ -191,6 +195,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     corpus,
                     reasoner=reasoner,
                     search=search,
+                    workspace=workspace,
+                    path_scope=path_scope,
                     retrieval_mode=args.retrieval,
                     index_version=index_version,
                     prompt_profile_id=profile_id,
@@ -234,8 +240,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_json(report.to_dict())
             return 0 if report.passed else 1
         if args.command == "research-eval":
-            _write_json(run_frozen_evaluation(args.suite_root).to_dict())
-            return 0
+            eval_report = run_frozen_evaluation(args.suite_root)
+            _write_json(eval_report.to_dict())
+            return 0 if eval_report.passed else 1
         if args.command == "research-suite-eval":
             suite_report = run_declarative_suite(args.suite_root)
             suite_payload = suite_report.to_dict()
@@ -245,7 +252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     encoding="utf-8",
                 )
             _write_json(suite_payload)
-            return 0
+            return 0 if suite_report.passed else 1
         if args.command == "claim-suite-validate":
             _write_json(validate_local_claim_suite(args.suite_root).to_dict())
             return 0
@@ -316,6 +323,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "serve":
             if args.port < 1 or args.port > 65535:
                 raise ValueError("port 必须在 1..65535")
+            workspace, path_scope = _build_workspace_and_scope(args)
+            if args.task_db is not None and path_scope is not None and path_scope.mode == "allow":
+                raise ValueError("persistent task API 不支持 allow workspace 写权限")
             try:
                 import uvicorn
             except ImportError as exc:
@@ -326,7 +336,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"session token: {token}", file=sys.stderr)
             host = "0.0.0.0" if args.bind == "container" else "127.0.0.1"
             uvicorn.run(
-                create_app(args.corpus, session_token=token, task_db=args.task_db),
+                create_app(
+                    args.corpus,
+                    session_token=token,
+                    task_db=args.task_db,
+                    workspace_root=workspace.root if workspace is not None else None,
+                    path_scope=path_scope,
+                ),
                 host=host, port=args.port, access_log=False,
             )
             return 0
@@ -353,6 +369,47 @@ def _write_json(value: object) -> None:
 
 def _interrupt_worker(_signum, _frame) -> None:
     raise KeyboardInterrupt
+
+
+def _add_workspace_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="optional local workspace root confined by --path-scope",
+    )
+    parser.add_argument(
+        "--path-scope",
+        choices=("allow", "deny", "interrupt"),
+        default=None,
+        help="declared filesystem permission mode (defaults to deny when --workspace is set)",
+    )
+    parser.add_argument(
+        "--scope-root",
+        action="append",
+        default=[],
+        help="relative root permitted under --path-scope allow",
+    )
+    parser.add_argument(
+        "--deny-glob",
+        action="append",
+        default=[],
+        help="relative glob denied inside --workspace",
+    )
+
+
+def _build_workspace_and_scope(args: argparse.Namespace) -> tuple[Workspace | None, PathScope | None]:
+    if args.workspace is None:
+        if args.path_scope is not None or args.scope_root or args.deny_glob:
+            raise ValueError("path_scope 需要 workspace")
+        return None, None
+    workspace = Workspace(args.workspace)
+    scope = PathScope(
+        mode=args.path_scope or "deny",
+        roots=tuple(args.scope_root),
+        deny_globs=tuple(args.deny_glob),
+    )
+    return workspace, scope
 
 
 def _add_memory_state_arguments(parser: argparse.ArgumentParser) -> None:

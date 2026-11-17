@@ -16,6 +16,7 @@ from .corpus import Corpus
 from .prompt_profiles import BASELINE_PROFILE_ID, get_prompt_profile
 from .reasoner import ReplayResearchReasoner
 from .tools import SearchProvider, ToolEvent, ToolRegistry, build_research_tools
+from .workspace import PathScope, Workspace
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class ResearchTrace:
     retrieved_candidates: int
     read_chunks: int
     write_calls: int
+    path_scope_mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +48,8 @@ class ResearchTrace:
             "prompt_profile_id": self.prompt_profile_id,
             "retrieved_candidates": self.retrieved_candidates,
             "read_chunks": self.read_chunks,
+            "write_calls": self.write_calls,
+            "path_scope_mode": self.path_scope_mode,
         }
 
 
@@ -66,8 +70,10 @@ class ResearchAgent:
         reasoner: Reasoner | None = None,
         tools: ToolRegistry | None = None,
         search: SearchProvider | None = None,
+        workspace: Workspace | None = None,
+        path_scope: PathScope | None = None,
         retrieval_mode: str = "lexical",
-        index_version:str | None = None,
+        index_version: str | None = None,
         prompt_profile_id: str = BASELINE_PROFILE_ID,
         long_term: LongTermMemory | None = None,
         memory_scope: str | None = None,
@@ -77,6 +83,10 @@ class ResearchAgent:
             raise ValueError("retrieval_mode 必须为 lexical 或 hybrid")
         if tools is not None and search is not None:
             raise ValueError("tools 与 search 不可同时注入")
+        if tools is not None and (workspace is not None or path_scope is not None):
+            raise ValueError("tools 与 workspace/path_scope 不可同时注入")
+        if path_scope is not None and workspace is None:
+            raise ValueError("path_scope 需要 workspace")
         if retrieval_mode == "hybrid" and (search is None or not index_version):
             raise ValueError("hybrid retrieval 需要 search 与 index_version")
         if retrieval_mode == "lexical" and index_version is not None:
@@ -85,7 +95,14 @@ class ResearchAgent:
             raise ValueError("long_term 与 memory_scope 必须成对提供")
         self.corpus = corpus
         self.reasoner = reasoner or ReplayResearchReasoner()
-        self.tools = tools or build_research_tools(corpus, search=search)
+        self.workspace = workspace
+        self.path_scope = None if workspace is None else (path_scope or PathScope(mode="deny"))
+        self.tools = tools or build_research_tools(
+            corpus,
+            search=search,
+            workspace=workspace,
+            path_scope=self.path_scope,
+        )
         self.retrieval_mode = retrieval_mode
         self.index_version = index_version
         self.prompt_profile = get_prompt_profile(prompt_profile_id)
@@ -140,6 +157,7 @@ class ResearchAgent:
             retrieved_candidates=self.tools.retrieved_candidates(),
             read_chunks=self.tools.read_chunks(),
             write_calls=self.tools.write_calls(),
+            path_scope_mode=self.path_scope.mode if self.path_scope is not None else None,
         )
         return ResearchRun(answer, trace)
 

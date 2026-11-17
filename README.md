@@ -17,7 +17,7 @@ python3 -m venv .venv
 .venv/bin/agentlab research --corpus ./example/corpus --question "你的问题"
 ```
 
-`research` 默认完全离线。`--live` 需要先安装 `.[live]`，并会把问题、选中的 chunks 和工具观察发给 OpenAI-compatible Provider；该边界也会写到 stderr。
+`research` 默认完全离线且只读。需要接入局部工作区读写工具时可显式传 `--workspace <dir>`，默认落入 fail-closed 的 `--path-scope deny`（也可选 `interrupt` 或 `allow --scope-root <rel> [--deny-glob <glob>]`）；`serve` 支持同一组参数，且启用 `--task-db` 时拒绝可写 `allow` 作用域。`--live` 需要先安装 `.[live]`，并会把问题、选中的 chunks 和工具观察发给 OpenAI-compatible Provider；该边界也会写到 stderr。
 
 ## Controlled Memory
 
@@ -116,7 +116,7 @@ X-AgentLab-Token: <当前会话 token>
 .venv/bin/agentlab research-eval --suite-root evals/research-agent
 ```
 
-冻结 suite 共 30 case，门槛为 citation validity 100%、unsupported factual claims 0、refusal contract 100%、retrieval recall@5 至少 0.90。它只证明确定性 fixture 上的工程契约，不证明模型质量、真实用户规模或业务效果。
+冻结 suite 共 30 case，门槛为 citation validity 100%、unsupported factual claims 0、refusal contract 100%、retrieval recall@5 至少 0.90；`research-eval`、`research-suite-eval` 与 `research-rag-eval` 在 `passed=false` 时均返回非零退出码 `1`。它只证明确定性 fixture 上的工程契约，不证明模型质量、真实用户规模或业务效果。
 
 Hybrid RAG 使用独立的冻结 suite v2：
 
@@ -269,5 +269,5 @@ zero-evidence inputs; the near-miss case is a recorded open gap.
 | 文档 | 内容 |
 | --- | --- |
 | [`docs/known-gaps.md`](docs/known-gaps.md) | 已实测的能力边界与根因、两次失败的修复尝试、复现命令 |
-| [`docs/isolation-attack-matrix.md`](docs/isolation-attack-matrix.md) | 26 行攻击矩阵：手法 → 防御 → 强制层 → 验证位置 → 实测结果，含刻意不防御项 |
+| [`docs/isolation-attack-matrix.md`](docs/isolation-attack-matrix.md) | 33 行攻击矩阵：手法 → 防御 → 强制层 → 验证位置 → 实测结果，含刻意不防御项 |
 | [`docs/fault-injection-experiments.md`](docs/fault-injection-experiments.md) | 6 次故意注入的回归实验，含两次发现自身假绿灯的过程 |

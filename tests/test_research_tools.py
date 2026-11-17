@@ -10,6 +10,7 @@ import pytest
 from agentlab.reasoning import ToolError
 from agentlab.research.corpus import Corpus
 from agentlab.research.tools import ToolRegistry, ToolSpec, build_research_tools
+from agentlab.research.workspace import PathScope, Workspace
 
 
 def _tools(tmp_path: Path):
@@ -104,3 +105,38 @@ def test_write_side_effect_calls_are_counted(tmp_path: Path) -> None:
     assert registry.write_calls() == 2
     registry.reset_events()
     assert registry.write_calls() == 0
+
+
+def test_path_scope_refusal_records_single_error_event_and_integrates_with_research_tools(
+    tmp_path: Path,
+) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "a.md").write_text("缓存使用 LRU 策略。", encoding="utf-8")
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    (ws_dir / "notes").mkdir()
+    (ws_dir / "notes" / "ok.md").write_text("note", encoding="utf-8")
+    (ws_dir / "secret.md").write_text("secret", encoding="utf-8")
+    ws = Workspace(ws_dir)
+
+    with pytest.raises(ValueError, match="path_scope 需要 workspace"):
+        build_research_tools(Corpus.load(corpus_dir), path_scope=PathScope(mode="deny"))
+
+    denied = build_research_tools(Corpus.load(corpus_dir), workspace=ws)
+    with pytest.raises(ToolError, match="^path_denied$"):
+        denied.call("read_file", '{"path":"notes/ok.md"}')
+    assert len(denied.events()) == 1
+    assert denied.events()[0].status == "error"
+
+    scoped = build_research_tools(
+        Corpus.load(corpus_dir),
+        workspace=ws,
+        path_scope=PathScope(mode="allow", roots=("notes",)),
+    )
+    assert set(scoped.names()) == {"list_sources", "search_corpus", "read_chunk", "read_file", "write_file"}
+    assert json.loads(scoped.call("read_file", '{"path":"notes/ok.md"}'))["data"]["text"] == "note"
+    with pytest.raises(ToolError, match="^path_outside_scope$"):
+        scoped.call("read_file", '{"path":"secret.md"}')
+    assert len(scoped.events()) == 2
+    assert scoped.events()[-1].status == "error"

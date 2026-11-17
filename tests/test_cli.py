@@ -12,6 +12,7 @@ import agentlab.cli as cli
 from agentlab.cli import main
 from agentlab.research.corpus import Corpus
 from agentlab.research.tasks import ResearchTaskStore
+from agentlab.research.workspace import PathScope
 
 
 def test_research_demo_is_byte_deterministic(capsys) -> None:
@@ -89,6 +90,37 @@ def test_research_eval_stdout_is_json(capsys) -> None:
     captured = capsys.readouterr()
     assert captured.err == ""
     assert json.loads(captured.out)["passed"] is True
+
+
+def test_research_eval_returns_nonzero_when_suite_fails(tmp_path: Path, monkeypatch, capsys) -> None:
+    report = SimpleNamespace(passed=False, to_dict=lambda: {"suite_id": "research-agent-suite-v1", "passed": False})
+    monkeypatch.setattr(cli, "run_frozen_evaluation", lambda root: report)
+    assert main(["research-eval", "--suite-root", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["passed"] is False
+
+
+def test_research_suite_eval_exit_codes_match_pass_status(tmp_path: Path, capsys) -> None:
+    repo_root = Path(__file__).parents[1]
+    assert main(["research-suite-eval", "--suite-root", str(repo_root / "evals" / "risk-v1")]) == 0
+    risk_payload = json.loads(capsys.readouterr().out)
+    assert risk_payload["passed"] is True
+
+    report_path = tmp_path / "external-report.json"
+    assert (
+        main([
+            "research-suite-eval",
+            "--suite-root",
+            str(repo_root / "evals" / "external-v1"),
+            "--report",
+            str(report_path),
+        ])
+        == 1
+    )
+    external_payload = json.loads(capsys.readouterr().out)
+    assert external_payload["passed"] is False
+    assert json.loads(report_path.read_text(encoding="utf-8")) == external_payload
 
 
 def test_claim_suite_validation_is_redacted_json(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -429,3 +461,113 @@ def test_serve_uses_explicit_loopback_or_container_host(tmp_path: Path, monkeypa
 def test_serve_rejects_invalid_port(tmp_path: Path, capsys) -> None:
     assert main(["serve", "--corpus", str(tmp_path), "--port", "0"]) == 2
     assert capsys.readouterr().err == "error: agentlab_command_failed\n"
+
+
+def test_research_cli_wires_workspace_and_path_scope(tmp_path: Path, capsys) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "fact.md").write_text("The Helix fixture status is ready.", encoding="utf-8")
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    (ws_dir / "notes").mkdir()
+
+    # Default --path-scope with --workspace is fail-closed deny.
+    assert (
+        main([
+            "research",
+            "--corpus",
+            str(corpus_dir),
+            "--workspace",
+            str(ws_dir),
+            "--question",
+            "What is the Helix fixture status?",
+        ])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["trace"]["path_scope_mode"] == "deny"
+    assert payload["trace"]["write_calls"] == 0
+
+    assert (
+        main([
+            "research",
+            "--corpus",
+            str(corpus_dir),
+            "--workspace",
+            str(ws_dir),
+            "--path-scope",
+            "allow",
+            "--scope-root",
+            "notes",
+            "--deny-glob",
+            "**/*.key",
+            "--question",
+            "What is the Helix fixture status?",
+        ])
+        == 0
+    )
+    allow_payload = json.loads(capsys.readouterr().out)
+    assert allow_payload["trace"]["path_scope_mode"] == "allow"
+
+    # Rejects --path-scope without --workspace and allow without --scope-root, without leaking path.
+    assert main(["research", "--corpus", str(corpus_dir), "--path-scope", "deny", "--question", "q"]) == 2
+    assert capsys.readouterr().err == "error: agentlab_command_failed\n"
+    assert main(["research", "--corpus", str(corpus_dir), "--workspace", str(ws_dir), "--path-scope", "allow", "--question", "q"]) == 2
+    assert capsys.readouterr().err == "error: agentlab_command_failed\n"
+
+    symlink_ws = tmp_path / "private-ws-link"
+    symlink_ws.symlink_to(ws_dir, target_is_directory=True)
+    assert main(["research", "--corpus", str(corpus_dir), "--workspace", str(symlink_ws), "--question", "q"]) == 2
+    err = capsys.readouterr().err
+    assert err == "error: agentlab_command_failed\n"
+    assert str(symlink_ws) not in err
+
+
+def test_serve_cli_wires_workspace_and_rejects_writable_task_db(tmp_path: Path, monkeypatch, capsys) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "fact.md").write_text("The server fixture is local.", encoding="utf-8")
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    (ws_dir / "notes").mkdir()
+
+    seen = []
+    monkeypatch.setattr("agentlab.api.create_app", lambda *args, **kwargs: (args, kwargs))
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: seen.append((app, kwargs)))
+
+    assert (
+        main([
+            "serve",
+            "--corpus",
+            str(corpus_dir),
+            "--workspace",
+            str(ws_dir),
+            "--path-scope",
+            "allow",
+            "--scope-root",
+            "notes",
+        ])
+        == 0
+    )
+    app_args, app_kwargs = seen[-1][0]
+    assert app_args == (corpus_dir,)
+    assert app_kwargs["workspace_root"] == ws_dir
+    assert app_kwargs["path_scope"] == PathScope(mode="allow", roots=("notes",))
+
+    assert (
+        main([
+            "serve",
+            "--corpus",
+            str(corpus_dir),
+            "--task-db",
+            str(tmp_path / "tasks.sqlite3"),
+            "--workspace",
+            str(ws_dir),
+            "--path-scope",
+            "allow",
+            "--scope-root",
+            "notes",
+        ])
+        == 2
+    )
+    assert "error: agentlab_command_failed\n" in capsys.readouterr().err

@@ -237,3 +237,60 @@ def test_escape_fallback_rejects_a_path_whose_parent_resolves_outside(ws: Worksp
     object.__setattr__(ws, "_root_real", Path("/nonexistent-root"))
     with pytest.raises(WorkspaceError, match="path_outside_scope"):
         ws.resolve("notes/a.md")
+
+
+def test_missing_open_flags_fail_closed(ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0)
+    with pytest.raises(WorkspaceError, match="platform_unsupported"):
+        Workspace(tmp_path / "root")
+    with pytest.raises(WorkspaceError, match="platform_unsupported"):
+        ws.read_text("notes/a.md")
+    with pytest.raises(WorkspaceError, match="platform_unsupported"):
+        ws.write_text("notes/new.md", "hello")
+
+    monkeypatch.undo()
+    monkeypatch.delattr(os, "O_DIRECTORY", raising=False)
+    with pytest.raises(WorkspaceError, match="platform_unsupported"):
+        Workspace(tmp_path / "root")
+    with pytest.raises(WorkspaceError, match="platform_unsupported"):
+        ws.resolve("notes/a.md")
+
+
+def test_read_and_write_do_not_reopen_by_path_after_resolve(
+    ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "secret.md"
+    outside.write_text("top-secret", encoding="utf-8")
+    original = ws._resolve_with_parent
+
+    def swap_to_symlink(relative: str, *, must_exist: bool = True):
+        resolved = original(relative, must_exist=must_exist)
+        target = ws.root / relative
+        if target.exists():
+            target.unlink()
+        target.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(ws, "_resolve_with_parent", swap_to_symlink)
+    with pytest.raises(WorkspaceError, match="path_symlink"):
+        ws.read_text("notes/a.md")
+    with pytest.raises(WorkspaceError, match="path_symlink"):
+        ws.write_text("notes/new-link.md", "pwned", overwrite=True)
+    assert outside.read_text(encoding="utf-8") == "top-secret"
+
+
+def test_read_rejects_fifo_swapped_after_resolve(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = ws._resolve_with_parent
+
+    def swap_to_fifo(relative: str, *, must_exist: bool = True):
+        resolved = original(relative, must_exist=must_exist)
+        target = ws.root / relative
+        target.unlink()
+        os.mkfifo(target)
+        return resolved
+
+    monkeypatch.setattr(ws, "_resolve_with_parent", swap_to_fifo)
+    with pytest.raises(WorkspaceError, match="path_not_regular_file"):
+        ws.read_text("notes/a.md")

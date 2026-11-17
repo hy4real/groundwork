@@ -9,13 +9,19 @@ from .research.agent import ResearchAgent
 from .research.corpus import Corpus
 from .research.tasks import ResearchTaskStore, TaskCapacityExceeded, TaskConflict, TaskStoreError
 from .research.task_events import emit_task_event
+from .research.workspace import PathScope, Workspace
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
 
 
 def create_app(
-    corpus_root: Path, *, session_token: str | None = None, task_db: Path | None = None,
+    corpus_root: Path,
+    *,
+    session_token: str | None = None,
+    task_db: Path | None = None,
+    workspace_root: Path | None = None,
+    path_scope: PathScope | None = None,
 ):
     try:
         from fastapi import FastAPI, Request
@@ -26,7 +32,13 @@ def create_app(
     except ImportError as exc:
         raise RuntimeError("serve extra 未安装") from exc
 
+    if path_scope is not None and workspace_root is None:
+        raise ValueError("path_scope 需要 workspace_root")
     corpus = Corpus.load(corpus_root)
+    workspace = Workspace(workspace_root) if workspace_root is not None else None
+    resolved_scope = None if workspace is None else (path_scope or PathScope(mode="deny"))
+    if task_db is not None and resolved_scope is not None and resolved_scope.mode == "allow":
+        raise ValueError("persistent task API 不支持 allow workspace 写权限")
     task_store = ResearchTaskStore(task_db) if task_db is not None else None
     token = session_token or secrets.token_urlsafe(32)
     if not token:
@@ -86,6 +98,8 @@ def create_app(
     app.state.research_request_type = ResearchRequest
     app.state.validation_error_handler = validation_error
     app.state.session_token = token
+    app.state.workspace = workspace
+    app.state.path_scope = resolved_scope
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -93,7 +107,7 @@ def create_app(
 
     @app.post("/v1/research")
     def research(request: ResearchRequest) -> dict[str, Any]:
-        return ResearchAgent(corpus).run(request.question).to_dict()
+        return ResearchAgent(corpus, workspace=workspace, path_scope=resolved_scope).run(request.question).to_dict()
 
     if task_store is not None:
         @app.post("/v1/research/tasks")

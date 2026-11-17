@@ -135,22 +135,17 @@ class ToolRegistry:
         if scope is None:
             return
         if scope.mode == "deny":
-            self._events.append(ToolEvent(tool, "error"))
             raise ToolError("path_denied")
         if scope.mode == "interrupt":
-            self._events.append(ToolEvent(tool, "error"))
             raise ToolError("approval_required")
         raw = value.get("path")
         if not isinstance(raw, str):
-            self._events.append(ToolEvent(tool, "error"))
             raise ToolError("path_outside_scope")
         try:
             permitted = scope_permits(scope, raw)
         except WorkspaceError as exc:
-            self._events.append(ToolEvent(tool, "error"))
             raise ToolError("path_outside_scope") from exc
         if not permitted:
-            self._events.append(ToolEvent(tool, "error"))
             raise ToolError("path_outside_scope")
 
     @staticmethod
@@ -168,7 +163,15 @@ class ToolRegistry:
                 raise ToolError("invalid_arguments")
 
 
-def build_research_tools(corpus: Corpus, *, search: SearchProvider | None = None) -> ToolRegistry:
+def build_research_tools(
+    corpus: Corpus,
+    *,
+    search: SearchProvider | None = None,
+    workspace: Workspace | None = None,
+    path_scope: PathScope | None = None,
+) -> ToolRegistry:
+    if path_scope is not None and workspace is None:
+        raise ValueError("path_scope 需要 workspace")
     search_provider = search or corpus
     registry = ToolRegistry()
     registry.register(
@@ -212,16 +215,13 @@ def build_research_tools(corpus: Corpus, *, search: SearchProvider | None = None
             handler=lambda args: _render_chunk(corpus, str(args["chunk_id"])),
         ),
     )
+    if workspace is not None:
+        register_workspace_tools(registry, workspace, scope=path_scope or PathScope(mode="deny"))
     return registry
 
 
-def build_workspace_tools(workspace: Workspace, *, scope: PathScope) -> ToolRegistry:
-    """Tools over a scoped workspace. The only place this project can write.
-
-    ``read_file`` and ``write_file`` both carry the same declared scope, so the
-    registry refuses a path outside it before the handler ever sees the call.
-    """
-    registry = ToolRegistry()
+def register_workspace_tools(registry: ToolRegistry, workspace: Workspace, *, scope: PathScope) -> ToolRegistry:
+    """Register scoped ``read_file`` and ``write_file`` tools onto ``registry``."""
 
     def _read(args: Mapping[str, Any]) -> dict[str, Any]:
         text, size = workspace.read_text(str(args["path"]))
@@ -256,6 +256,15 @@ def build_workspace_tools(workspace: Workspace, *, scope: PathScope) -> ToolRegi
         ),
     )
     return registry
+
+
+def build_workspace_tools(workspace: Workspace, *, scope: PathScope) -> ToolRegistry:
+    """Tools over a scoped workspace. The only place this project can write.
+
+    ``read_file`` and ``write_file`` both carry the same declared scope, so the
+    registry refuses a path outside it before the handler ever sees the call.
+    """
+    return register_workspace_tools(ToolRegistry(), workspace, scope=scope)
 
 
 def _render_chunk(corpus: Corpus, chunk_id: str) -> dict[str, Any]:

@@ -11,6 +11,7 @@ module enforces *how* a path inside those roots is resolved.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from dataclasses import dataclass, field
@@ -57,6 +58,13 @@ def _reject(reason: str) -> "WorkspaceError":
     return WorkspaceError(reason)
 
 
+def _require_open_flag(name: str) -> int:
+    flag = getattr(os, name, 0)
+    if not flag:
+        raise _reject("platform_unsupported")
+    return int(flag)
+
+
 def _relative_parts(relative: str) -> tuple[str, ...]:
     """Split a caller-supplied path into vetted components, or raise."""
     if not isinstance(relative, str) or not relative:
@@ -86,6 +94,8 @@ class Workspace:
     """One root directory. All reads and writes are confined to it."""
 
     def __init__(self, root: Path) -> None:
+        _require_open_flag("O_DIRECTORY")
+        _require_open_flag("O_NOFOLLOW")
         root = Path(root)
         if root.is_symlink():
             raise _reject("root_symlink")
@@ -99,11 +109,25 @@ class Workspace:
         return self._root
 
     def _open_root(self) -> int:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | _require_open_flag("O_DIRECTORY")
+            | _require_open_flag("O_NOFOLLOW")
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         try:
-            return os.open(self._root, flags)
+            fd = os.open(self._root, flags)
         except OSError as exc:  # pragma: no cover - root re-checked in __init__
+            if exc.errno == errno.ELOOP:
+                raise _reject("root_symlink") from exc
             raise _reject("root_unreadable") from exc
+        try:
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):  # pragma: no cover - O_DIRECTORY enforced
+                raise _reject("root_not_directory")
+        except Exception:
+            os.close(fd)
+            raise
+        return fd
 
     def _stat_at(self, dir_fd: int, name: str) -> os.stat_result:
         try:
@@ -113,21 +137,28 @@ class Workspace:
         except OSError as exc:
             raise _reject("path_unreadable") from exc
 
-    def resolve(self, relative: str, *, must_exist: bool = True) -> Path:
-        """Resolve a relative path inside the root without following symlinks."""
+    def _resolve_with_parent(self, relative: str, *, must_exist: bool = True) -> tuple[int, str, Path]:
+        """Walk relative components on dir_fd and return ``(parent_fd, last_name, resolved_path)``."""
         parts = _relative_parts(relative)
         fd = self._open_root()
         try:
+            dir_flags = (
+                os.O_RDONLY
+                | _require_open_flag("O_DIRECTORY")
+                | _require_open_flag("O_NOFOLLOW")
+                | getattr(os, "O_CLOEXEC", 0)
+            )
             for part in parts[:-1]:
                 info = self._stat_at(fd, part)
                 if stat.S_ISLNK(info.st_mode):
                     raise _reject("path_symlink")
                 if not stat.S_ISDIR(info.st_mode):
                     raise _reject("path_not_directory")
-                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
                 try:
-                    next_fd = os.open(part, flags, dir_fd=fd)
+                    next_fd = os.open(part, dir_flags, dir_fd=fd)
                 except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise _reject("path_symlink") from exc
                     raise _reject("path_unreadable") from exc
                 os.close(fd)
                 fd = next_fd
@@ -145,30 +176,65 @@ class Workspace:
                     raise _reject("path_symlink")
                 if not stat.S_ISREG(last_info.st_mode):
                     raise _reject("path_not_regular_file")
-        finally:
-            os.close(fd)
 
-        candidate = self._root.joinpath(*parts)
-        resolved = candidate.parent.resolve(strict=True).joinpath(parts[-1])
-        if not resolved.is_relative_to(self._root_real):
-            raise _reject("path_outside_scope")
+            candidate = self._root.joinpath(*parts)
+            resolved = candidate.parent.resolve(strict=True).joinpath(last)
+            if not resolved.is_relative_to(self._root_real):
+                raise _reject("path_outside_scope")
+            return fd, last, resolved
+        except Exception:
+            os.close(fd)
+            raise
+
+    def resolve(self, relative: str, *, must_exist: bool = True) -> Path:
+        """Resolve a relative path inside the root without following symlinks."""
+        fd, _last, resolved = self._resolve_with_parent(relative, must_exist=must_exist)
+        os.close(fd)
         return resolved
 
     def relative_of(self, path: Path) -> str:
         return path.relative_to(self._root_real).as_posix()
 
     def read_text(self, relative: str, *, max_bytes: int = MAX_WRITE_BYTES) -> tuple[str, int]:
-        path = self.resolve(relative)
+        dir_fd, last, _resolved = self._resolve_with_parent(relative, must_exist=True)
         try:
-            size = path.stat().st_size
-        except OSError as exc:
-            raise _reject("path_unreadable") from exc
-        if size > max_bytes:
-            raise _reject("file_too_large")
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            raise _reject("path_unreadable") from exc
+            flags = (
+                os.O_RDONLY
+                | _require_open_flag("O_NOFOLLOW")
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                file_fd = os.open(last, flags, dir_fd=dir_fd)
+            except FileNotFoundError as exc:
+                raise _reject("path_missing") from exc
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise _reject("path_symlink") from exc
+                raise _reject("path_unreadable") from exc
+            try:
+                info = os.fstat(file_fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise _reject("path_not_regular_file")
+                if info.st_size > max_bytes:
+                    raise _reject("file_too_large")
+                chunks = bytearray()
+                while len(chunks) <= max_bytes:
+                    block = os.read(file_fd, min(64 * 1024, max_bytes + 1 - len(chunks)))
+                    if not block:
+                        break
+                    chunks.extend(block)
+                if len(chunks) > max_bytes:
+                    raise _reject("file_too_large")
+                data = bytes(chunks)
+            except WorkspaceError:
+                raise
+            except OSError as exc:
+                raise _reject("path_unreadable") from exc
+            finally:
+                os.close(file_fd)
+        finally:
+            os.close(dir_fd)
         try:
             return data.decode("utf-8"), len(data)
         except UnicodeDecodeError as exc:
@@ -180,22 +246,38 @@ class Workspace:
         payload = text.encode("utf-8")
         if len(payload) > MAX_WRITE_BYTES:
             raise _reject("file_too_large")
-        path = self.resolve(relative, must_exist=False)
-        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        flags |= os.O_TRUNC if overwrite else os.O_EXCL
+        dir_fd, last, _resolved = self._resolve_with_parent(relative, must_exist=False)
         try:
-            descriptor = os.open(path, flags, 0o600)
-        except FileExistsError as exc:
-            raise _reject("file_exists") from exc
-        except OSError as exc:
-            raise _reject("write_failed") from exc
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except OSError as exc:
-            raise _reject("write_failed") from exc
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | _require_open_flag("O_NOFOLLOW")
+                | getattr(os, "O_CLOEXEC", 0)
+                | (os.O_TRUNC if overwrite else os.O_EXCL)
+            )
+            try:
+                descriptor = os.open(last, flags, 0o600, dir_fd=dir_fd)
+            except FileExistsError as exc:
+                raise _reject("file_exists") from exc
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise _reject("path_symlink") from exc
+                raise _reject("write_failed") from exc
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise _reject("path_not_regular_file")
+            except Exception:
+                os.close(descriptor)
+                raise
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                raise _reject("write_failed") from exc
+        finally:
+            os.close(dir_fd)
         return len(payload)
 
 

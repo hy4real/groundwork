@@ -14,6 +14,7 @@ from agentlab.api import create_app
 from agentlab.research.corpus import Corpus
 from agentlab.research.tasks import MAX_OUTSTANDING_TASKS, ResearchTaskStore, TaskStoreError
 from agentlab.research.worker import ResearchWorker
+from agentlab.research.workspace import PathScope
 
 
 def _app(tmp_path: Path):
@@ -251,3 +252,48 @@ async def test_research_http_rejects_non_loopback_origin(tmp_path: Path) -> None
         )
     assert response.status_code == 403
     assert response.json() == {"error": "forbidden"}
+
+
+@pytest.mark.anyio
+async def test_api_wires_workspace_path_scope_and_enforces_task_read_only_boundary(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "fact.md").write_text("The API fixture state is healthy.", encoding="utf-8")
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    (ws_dir / "notes").mkdir()
+
+    with pytest.raises(ValueError, match="path_scope 需要 workspace_root"):
+        create_app(corpus_dir, path_scope=PathScope(mode="deny"))
+    with pytest.raises(ValueError, match="persistent task API"):
+        create_app(
+            corpus_dir,
+            task_db=tmp_path / "state" / "tasks.sqlite3",
+            workspace_root=ws_dir,
+            path_scope=PathScope(mode="allow", roots=("notes",)),
+        )
+
+    app_default_deny = create_app(corpus_dir, workspace_root=ws_dir)
+    assert app_default_deny.state.path_scope == PathScope(mode="deny")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_default_deny), base_url="http://127.0.0.1") as client:
+        response = await client.post(
+            "/v1/research",
+            json={"question": "What is the API fixture state?"},
+            headers={"X-AgentLab-Token": app_default_deny.state.session_token},
+        )
+    assert response.status_code == 200
+    assert response.json()["trace"]["path_scope_mode"] == "deny"
+
+    app_allow = create_app(
+        corpus_dir,
+        workspace_root=ws_dir,
+        path_scope=PathScope(mode="allow", roots=("notes",)),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_allow), base_url="http://127.0.0.1") as client:
+        response = await client.post(
+            "/v1/research",
+            json={"question": "What is the API fixture state?"},
+            headers={"X-AgentLab-Token": app_allow.state.session_token},
+        )
+    assert response.status_code == 200
+    assert response.json()["trace"]["path_scope_mode"] == "allow"

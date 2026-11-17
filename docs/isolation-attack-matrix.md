@@ -53,7 +53,7 @@ corresponding defence is removed — see
 | A27 | Tool asks for an absolute path (`/etc/passwd`) | `Workspace.resolve` rejects absolute paths before any syscall | tool call | `test_rejects_paths_that_do_not_name_a_file_inside_the_root` | `ToolError("path_outside_scope")` |
 | A28 | Traversal (`../x`, `notes/../../x`) | every `..` component rejected outright | tool call | same test + `test_traversal_reaches_the_registry_as_a_tool_error` | `path_outside_scope` |
 | A29 | A path component is a symlink pointing outside the root | component-wise `O_NOFOLLOW` walk on an open directory descriptor | tool call | `test_rejects_symlinked_directory_component` | `path_symlink` |
-| A30 | A file is a symlink to a victim outside | `stat(..., follow_symlinks=False)` rejects before open | tool call | `test_rejects_symlinked_file`, `test_write_cannot_follow_a_planted_symlink` | `path_symlink`, victim unchanged |
+| A30 | A file is a symlink to a victim outside | `stat(..., follow_symlinks=False)` + `os.open(..., dir_fd=..., O_NOFOLLOW)` with no path re-open; missing `O_NOFOLLOW`/`O_DIRECTORY` fails closed | tool call | `test_rejects_symlinked_file`, `test_write_cannot_follow_a_planted_symlink`, `test_read_and_write_do_not_reopen_by_path_after_resolve`, `test_missing_open_flags_fail_closed` | `path_symlink` / `platform_unsupported`, victim unchanged |
 | A31 | The workspace root itself is a symlink | `root.is_symlink()` rejected at construction | construction | `test_rejects_symlinked_root` | `root_symlink` |
 | A32 | Write silently overwrites an existing file | `O_EXCL` unless `overwrite=True` is passed explicitly | tool call | `test_write_is_exclusive_by_default`, `test_write_needs_an_explicit_overwrite_flag` | `file_exists`, original preserved |
 | A33 | A write-capable tool runs without a declared scope | `ToolSpec` refuses `path_scope` with `side_effect="none"`; registry refuses `deny`; `interrupt` returns `approval_required` and never auto-approves | construction + tool call | `test_declared_scope_is_required_to_match_side_effect`, `test_registry_never_auto_approves_an_interrupt_scope` | refused |
@@ -63,7 +63,12 @@ project had no write surface, so a path sandbox had nothing to constrain. W6 add
 `Workspace` plus the `read_file` / `write_file` tools, which makes the scope real:
 `ToolSpec.path_scope` carries a three-mode declaration (`allow` / `deny` /
 `interrupt`) modelled on Deep Agents' `FilesystemPermission`, and
-`ToolRegistry.call()` enforces it before the handler runs.
+`ToolRegistry.call()` enforces it before the handler runs. `ResearchAgent`,
+`agentlab research`, `agentlab serve` and `create_app` wire `Workspace` and
+`PathScope` via `register_workspace_tools` (defaulting to fail-closed `deny`
+when `--workspace` is passed without `--path-scope`, while keeping default
+corpus-only `ResearchAgent(corpus)` read-only and rejecting `--task-db` with
+writable `allow`).
 
 Fault injection against this new code: E7 (drop the symlink check), E8 (drop the
 post-walk containment fallback), E9 (auto-approve `interrupt`), E10 (drop

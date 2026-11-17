@@ -14,6 +14,7 @@ from agentlab.research.agent import ResearchAgent
 from agentlab.research.corpus import Corpus
 from agentlab.research.corpus import SearchHit
 from agentlab.research.retrieval import HybridRetriever
+from agentlab.research.workspace import PathScope, Workspace
 
 
 def _agent(tmp_path: Path) -> ResearchAgent:
@@ -188,3 +189,86 @@ def test_hybrid_mode_requires_real_search_and_index_provenance(tmp_path: Path) -
     corpus = _agent(tmp_path).corpus
     with pytest.raises(ValueError, match="search 与 index_version"):
         ResearchAgent(corpus, retrieval_mode="hybrid")
+
+
+def test_agent_enforces_workspace_path_scope_modes_end_to_end(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "fact.md").write_text("AgentEnvironment runs the tool loop.", encoding="utf-8")
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    (ws_dir / "notes").mkdir()
+    (ws_dir / "notes" / "ok.md").write_text("allowed-note", encoding="utf-8")
+    (ws_dir / "notes" / "secret.key").write_text("key-secret", encoding="utf-8")
+    (ws_dir / "outside.md").write_text("outside", encoding="utf-8")
+    outside_target = tmp_path / "victim.md"
+    outside_target.write_text("untouched", encoding="utf-8")
+    (ws_dir / "notes" / "escape.md").symlink_to(outside_target)
+    ws = Workspace(ws_dir)
+    corpus = Corpus.load(corpus_dir)
+
+    with pytest.raises(ValueError, match="path_scope 需要 workspace"):
+        ResearchAgent(corpus, path_scope=PathScope(mode="deny"))
+    with pytest.raises(ValueError, match="tools 与 workspace"):
+        ResearchAgent(corpus, tools=ResearchAgent(corpus).tools, workspace=ws)
+
+    class ScriptedWorkspaceReasoner:
+        def __init__(self, calls: tuple[tuple[str, str], ...]) -> None:
+            self.calls = calls
+            self.index = 0
+
+        def decide(self, *, task, context, available_tools):
+            assert "read_file" in available_tools and "write_file" in available_tools
+            if self.index < len(self.calls):
+                tool, arg = self.calls[self.index]
+                self.index += 1
+                return Action(kind="tool", tool=tool, argument=arg)
+            return Action(
+                kind="finish",
+                answer='{"status":"insufficient_evidence","answer":"","claims":[],"reason":"workspace_checked"}',
+            )
+
+    # 1. workspace without explicit path_scope defaults fail-closed to deny.
+    denied_run = ResearchAgent(
+        corpus,
+        workspace=ws,
+        reasoner=ScriptedWorkspaceReasoner((("read_file", '{"path":"notes/ok.md"}'),)),
+        clock=lambda: 0.0,
+    ).run("check deny")
+    assert denied_run.trace.path_scope_mode == "deny"
+    assert denied_run.trace.to_dict()["path_scope_mode"] == "deny"
+    assert denied_run.trace.write_calls == 0
+    assert denied_run.trace.tool_events[-1].status == "error"
+
+    # 2. interrupt never auto-approves.
+    interrupt_run = ResearchAgent(
+        corpus,
+        workspace=ws,
+        path_scope=PathScope(mode="interrupt", roots=("notes",)),
+        reasoner=ScriptedWorkspaceReasoner((("write_file", '{"path":"notes/new.md","text":"x"}'),)),
+        clock=lambda: 0.0,
+    ).run("check interrupt")
+    assert interrupt_run.trace.path_scope_mode == "interrupt"
+    assert interrupt_run.trace.write_calls == 0
+    assert not (ws_dir / "notes" / "new.md").exists()
+
+    # 3. allow permits only declared roots while blocking outside paths, deny_globs, and symlinks.
+    allow_run = ResearchAgent(
+        corpus,
+        workspace=ws,
+        path_scope=PathScope(mode="allow", roots=("notes",), deny_globs=("**/*.key",)),
+        reasoner=ScriptedWorkspaceReasoner((
+            ("read_file", '{"path":"outside.md"}'),
+            ("read_file", '{"path":"notes/secret.key"}'),
+            ("read_file", '{"path":"notes/escape.md"}'),
+            ("write_file", '{"path":"notes/created.md","text":"hello"}'),
+            ("read_file", '{"path":"notes/created.md"}'),
+        )),
+        clock=lambda: 0.0,
+    ).run("check allow")
+    assert allow_run.trace.path_scope_mode == "allow"
+    assert allow_run.trace.write_calls == 1
+    assert allow_run.trace.to_dict()["write_calls"] == 1
+    assert [e.status for e in allow_run.trace.tool_events] == ["error", "error", "error", "ok", "ok"]
+    assert (ws_dir / "notes" / "created.md").read_text(encoding="utf-8") == "hello"
+    assert outside_target.read_text(encoding="utf-8") == "untouched"
