@@ -16,11 +16,11 @@ _SPEC.loader.exec_module(_MODULE)
 audit = _MODULE.audit
 
 
-def _sdist(tmp_path: Path, members: dict[str, bytes]) -> Path:
-    path = tmp_path / "agent_lab-1.1.0.tar.gz"
+def _sdist(tmp_path: Path, members: dict[str, bytes], *, prefix: str = "groundwork-1.5.0") -> Path:
+    path = tmp_path / f"{prefix}.tar.gz"
     with tarfile.open(path, "w:gz") as archive:
         for name, content in members.items():
-            info = tarfile.TarInfo(f"agent_lab-1.1.0/{name}")
+            info = tarfile.TarInfo(f"{prefix}/{name}")
             info.size = len(content)
             archive.addfile(info, io.BytesIO(content))
     return path
@@ -31,6 +31,11 @@ def test_audit_rejects_unlisted_private_member(tmp_path: Path) -> None:
     assert "unexpected archive member: docs/private-corpus.md" in failures
 
 
+def test_audit_rejects_legacy_sdist_prefix(tmp_path: Path) -> None:
+    failures = audit(_sdist(tmp_path, {"README.md": b"legacy"}, prefix="agent_lab-1.5.0"))
+    assert "invalid sdist root: agent_lab-1.5.0/README.md" in failures
+
+
 def test_audit_rejects_posix_home_path(tmp_path: Path) -> None:
     private_path = b"/" + b"home/example/secrets/private.txt"
     failures = audit(_sdist(tmp_path, {"README.md": private_path}))
@@ -38,13 +43,13 @@ def test_audit_rejects_posix_home_path(tmp_path: Path) -> None:
 
 
 def test_audit_rejects_duplicate_and_symlink_members(tmp_path: Path) -> None:
-    path = tmp_path / "agent_lab-1.1.0.tar.gz"
+    path = tmp_path / "groundwork-1.5.0.tar.gz"
     with tarfile.open(path, "w:gz") as archive:
         for content in (b"first", b"second"):
-            info = tarfile.TarInfo("agent_lab-1.1.0/README.md")
+            info = tarfile.TarInfo("groundwork-1.5.0/README.md")
             info.size = len(content)
             archive.addfile(info, io.BytesIO(content))
-        link = tarfile.TarInfo("agent_lab-1.1.0/docs/private-link.md")
+        link = tarfile.TarInfo("groundwork-1.5.0/docs/private-link.md")
         link.type = tarfile.SYMTYPE
         link.linkname = "../README.md"
         archive.addfile(link)

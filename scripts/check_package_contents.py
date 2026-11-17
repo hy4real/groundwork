@@ -265,7 +265,7 @@ def audit(path: Path) -> list[str]:
         name = archive_name
         if not is_wheel:
             parts = PurePosixPath(archive_name).parts
-            if len(parts) < 2 or not parts[0].startswith("agent_lab-"):
+            if len(parts) < 2 or not parts[0].startswith("groundwork-"):
                 failures.append(f"invalid sdist root: {archive_name}")
                 continue
             name = PurePosixPath(*parts[1:]).as_posix()
